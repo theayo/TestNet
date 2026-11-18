@@ -55,7 +55,7 @@ class DownloadHandler(BaseHTTPRequestHandler):
 
 
 class DownloadTimingTests(unittest.TestCase):
-    def test_request_timing_includes_open_and_reads_but_excludes_progress(self):
+    def test_request_timing_includes_open_and_reads_before_final_progress(self):
         steps = Mock()
         steps.perf_counter.side_effect = [10.0, 17.0]
         steps.read.side_effect = [FIRST_PART, LAST_PART, b""]
@@ -87,6 +87,46 @@ class DownloadTimingTests(unittest.TestCase):
                 call.print_progress(1, PAYLOAD_SIZE, 7.0),
             ],
         )
+
+    def test_slow_live_output_can_overlap_download(self):
+        output_started = threading.Event()
+        download_measured = threading.Event()
+        output_timed_out = threading.Event()
+
+        class SlowTerminal(StringIO):
+            def write(self, text):
+                if "50.0%" in text:
+                    output_started.set()
+                    if not download_measured.wait(3):
+                        output_timed_out.set()
+                return super().write(text)
+
+        def read_chunks():
+            yield FIRST_PART
+            self.assertTrue(output_started.wait(3), "Partial progress was not rendered")
+            yield FIRST_PART
+            yield b""
+
+        def timestamps():
+            yield 10.0
+            download_measured.set()
+            yield 17.0
+
+        response = Mock(length=2 * len(FIRST_PART))
+        response.read.side_effect = read_chunks()
+        clock = Mock()
+        clock.perf_counter.side_effect = timestamps()
+        stderr = SlowTerminal()
+
+        with redirect_stderr(stderr), patch.multiple(
+            speedtest, time=clock, urlopen=Mock(return_value=nullcontext(response))
+        ):
+            with speedtest.LiveProgress(1) as progress:
+                result = speedtest.download_once("http://example.test/file", progress)
+
+        self.assertEqual(result, (2 * len(FIRST_PART), 7.0))
+        self.assertIn("50.0%", stderr.getvalue())
+        self.assertFalse(output_timed_out.is_set(), "Download waited on the terminal")
 
 
 class SpeedtestTests(unittest.TestCase):

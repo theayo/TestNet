@@ -1,7 +1,9 @@
 import argparse
 import os
 import sys
+import threading
 import time
+from contextlib import nullcontext
 from http.client import HTTPException
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
@@ -13,6 +15,7 @@ from download_errors import ERROR_RULES, HTTP_MESSAGES, TruncatedResponse
 REQUEST_COUNT = 10
 CHUNK_SIZE = 64 * 1024
 TIMEOUT_SECONDS = 30
+PROGRESS_INTERVAL_SECONDS = 0.25
 BYTES_PER_MIB = 1024 * 1024
 DEFAULT_URL = "https://proof.ovh.net/files/1Mb.dat"
 
@@ -70,6 +73,50 @@ def colorize(text, color, stream=None):
     return f"\033[{color}m{text}\033[0m"
 
 
+class LiveProgress:
+    def __init__(self, request_number):
+        self.request_number = request_number
+        self._counts = (0, None)
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._line_width = 0
+        self._worker = threading.Thread(target=self._render, daemon=True)
+
+    def __enter__(self):
+        self._worker.start()
+        return self
+
+    def __exit__(self, *exc_info):
+        self._stop.set()
+        self._worker.join()
+        if self._line_width:
+            sys.stderr.write("\r" + " " * self._line_width + "\r")
+            sys.stderr.flush()
+
+    def update(self, downloaded_bytes, total_size):
+        with self._lock:
+            self._counts = downloaded_bytes, total_size
+
+    def _render(self):
+        while not self._stop.wait(PROGRESS_INTERVAL_SECONDS):
+            with self._lock:
+                downloaded_bytes, total_size = self._counts
+
+            message = (
+                f"[{self.request_number}/{REQUEST_COUNT}] "
+                f"Скачано: {downloaded_bytes / BYTES_PER_MIB:.2f} MiB"
+            )
+            if total_size:
+                message += f" ({downloaded_bytes / total_size:.1%})"
+            self._line_width = len(message)
+            print(
+                "\r" + colorize(message, "36", stream=sys.stderr),
+                end="",
+                file=sys.stderr,
+                flush=True,
+            )
+
+
 def print_progress(request_number, downloaded_bytes, elapsed):
     downloaded_mib = downloaded_bytes / BYTES_PER_MIB
     progress = (
@@ -83,7 +130,7 @@ def print_progress(request_number, downloaded_bytes, elapsed):
     )
 
 
-def download_once(url: str) -> tuple[int, float]:
+def download_once(url: str, progress=None) -> tuple[int, float]:
     request = Request(
         url,
         headers={"Accept-Encoding": "identity", "Cache-Control": "no-cache"},
@@ -92,9 +139,13 @@ def download_once(url: str) -> tuple[int, float]:
     started_at = time.perf_counter()
     with urlopen(request, timeout=TIMEOUT_SECONDS) as response:
         total_size = getattr(response, "length", None)
+        if progress is not None:
+            progress.update(downloaded_bytes, total_size)
 
         while chunk := response.read(CHUNK_SIZE):
             downloaded_bytes += len(chunk)
+            if progress is not None:
+                progress.update(downloaded_bytes, total_size)
 
         if total_size is not None and downloaded_bytes != total_size:
             expected = f"{total_size:,}".replace(",", " ")
@@ -149,8 +200,10 @@ def main():
     total_time = 0.0
 
     for request_number in range(1, REQUEST_COUNT + 1):
+        progress = LiveProgress(request_number) if show_progress else nullcontext()
         try:
-            downloaded_bytes, elapsed = download_once(address)
+            with progress as live_progress:
+                downloaded_bytes, elapsed = download_once(address, live_progress)
         except (URLError, OSError, ValueError, HTTPException) as error:
             print_error(describe_error(error), request_number)
             return 1
